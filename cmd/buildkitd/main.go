@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/user"
@@ -14,15 +15,33 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/content/local"
+	ctdmetadata "github.com/containerd/containerd/metadata"
 	"github.com/containerd/containerd/pkg/seed"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/sys"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
+	"github.com/docker/docker/builder/builder-next/adapters/containerimage"
+	"github.com/docker/docker/builder/builder-next/adapters/snapshot"
+	containerimageexp "github.com/docker/docker/builder/builder-next/exporter"
+	"github.com/docker/docker/builder/builder-next/imagerefchecker"
+	mobyworker "github.com/docker/docker/builder/builder-next/worker"
+	"github.com/docker/docker/daemon/graphdriver"
+	_ "github.com/docker/docker/daemon/graphdriver/overlay2"
+	"github.com/docker/docker/daemon/images"
+	dmetadata "github.com/docker/docker/distribution/metadata"
+	"github.com/docker/docker/image"
+	"github.com/docker/docker/layer"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/reexec"
+	refstore "github.com/docker/docker/reference"
 	"github.com/gofrs/flock"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/gha"
 	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
@@ -31,12 +50,15 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/control"
+	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
+	"github.com/moby/buildkit/executor/runcexecutor"
 	"github.com/moby/buildkit/frontend"
 	dockerfile "github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
 	"github.com/moby/buildkit/session"
+	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/appcontext"
@@ -44,6 +66,9 @@ import (
 	"github.com/moby/buildkit/util/archutil"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/grpcerrors"
+	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/buildkit/util/network/cniprovider"
+	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/profiler"
 	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/stack"
@@ -53,10 +78,12 @@ import (
 	"github.com/moby/buildkit/util/tracing/transform"
 	"github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
+	"github.com/moby/buildkit/worker/envd"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	bolt "go.etcd.io/bbolt"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -259,7 +286,56 @@ func main() {
 			os.RemoveAll(lockPath)
 		}()
 
-		controller, err := newController(c, &cfg)
+		dockerRoot := "/var/lib/docker"
+		graphDriver := "overlay2"
+		layerStore, err := layer.NewStoreFromOptions(layer.StoreOptions{
+			Root:                      dockerRoot,
+			MetadataStorePathTemplate: filepath.Join(dockerRoot, "image", "%s", "layerdb"),
+			GraphDriver:               graphDriver,
+			GraphDriverOptions:        []string{},
+			IDMapping:                 idtools.IdentityMapping{},
+			ExperimentalEnabled:       false,
+		})
+		if err != nil {
+			panic(err)
+		}
+		m := layerStore.Map()
+		for k, v := range m {
+			println(k, v)
+		}
+		imageRoot := filepath.Join(dockerRoot, "image", graphDriver)
+		ifs, err := image.NewFSStoreBackend(filepath.Join(imageRoot, "imagedb"))
+		if err != nil {
+			panic(err)
+		}
+
+		imageStore, err := image.NewImageStore(ifs, layerStore)
+		if err != nil {
+			panic(err)
+		}
+		im := imageStore.Map()
+		for k, v := range im {
+			println(k, v.Size)
+		}
+
+		refStoreLocation := filepath.Join(imageRoot, `repositories.json`)
+		rs, err := refstore.NewReferenceStore(refStoreLocation)
+		if err != nil {
+			panic(err)
+		}
+		distributionMetadataStore, err := dmetadata.NewFSMetadataStore(filepath.Join(imageRoot, "distribution"))
+		if err != nil {
+			panic(err)
+		}
+		imgSvcConfig := images.ImageServiceConfig{
+			DistributionMetadataStore: distributionMetadataStore,
+			ImageStore:                imageStore,
+			LayerStore:                layerStore,
+			ReferenceStore:            rs,
+		}
+		imageService := images.NewImageService(imgSvcConfig)
+
+		controller, err := newController(c, &cfg, imageService)
 		if err != nil {
 			return err
 		}
@@ -607,7 +683,7 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	return tlsConf, nil
 }
 
-func newController(c *cli.Context, cfg *config.Config) (*control.Controller, error) {
+func newController(c *cli.Context, cfg *config.Config, is *images.ImageService) (*control.Controller, error) {
 	sessionManager, err := session.NewManager()
 	if err != nil {
 		return nil, err
@@ -626,6 +702,154 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		}
 	}
 
+	root := "/var/lib/buildkit/envd/"
+	dist := is.DistributionServices()
+	idmap := idtools.IdentityMapping{}
+	var driver graphdriver.Driver
+	if ls, ok := dist.LayerStore.(interface {
+		Driver() graphdriver.Driver
+	}); ok {
+		driver = ls.Driver()
+	} else {
+		return nil, errors.Errorf("could not access graphdriver")
+	}
+
+	store, err := local.NewStore(filepath.Join(root, "content"))
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := bolt.Open(filepath.Join(root, "containerdmeta.db"), 0644, nil)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{})
+
+	store = containerdsnapshot.NewContentStore(mdb.ContentStore(), "buildkit")
+
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+
+	snapshotter, lm, err := snapshot.NewSnapshotter(snapshot.Opt{
+		GraphDriver:     driver,
+		LayerStore:      dist.LayerStore,
+		Root:            root,
+		IdentityMapping: idmap,
+	}, lm)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cache.MigrateV2(context.Background(), filepath.Join(root, "metadata.db"), filepath.Join(root, "metadata_v2.db"), store, snapshotter, lm); err != nil {
+		return nil, err
+	}
+
+	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"))
+	if err != nil {
+		return nil, err
+	}
+
+	layerGetter, ok := snapshotter.(imagerefchecker.LayerGetter)
+	if !ok {
+		return nil, errors.Errorf("snapshotter does not implement layergetter")
+	}
+
+	refChecker := imagerefchecker.New(imagerefchecker.Opt{
+		ImageStore:  dist.ImageStore,
+		LayerGetter: layerGetter,
+	})
+
+	cm, err := cache.NewManager(cache.ManagerOpt{
+		Snapshotter:     snapshotter,
+		MetadataStore:   md,
+		PruneRefChecker: refChecker,
+		LeaseManager:    lm,
+		ContentStore:    store,
+		GarbageCollect:  mdb.GarbageCollect,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	src, err := containerimage.NewSource(containerimage.SourceOpt{
+		CacheAccessor:   cm,
+		ContentStore:    store,
+		DownloadManager: dist.DownloadManager,
+		MetadataStore:   dist.V2MetadataService,
+		ImageStore:      dist.ImageStore,
+		ReferenceStore:  dist.ReferenceStore,
+		// RegistryHosts:   opt.RegistryHosts,
+		LayerStore:     dist.LayerStore,
+		LeaseManager:   lm,
+		GarbageCollect: mdb.GarbageCollect,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	dns := getDNSConfig(nil)
+
+	exec, err := newExecutor(root, "docker", dns, false, &idmap, "")
+	if err != nil {
+		return nil, err
+	}
+
+	differ, ok := snapshotter.(containerimageexp.Differ)
+	if !ok {
+		return nil, errors.Errorf("snapshotter doesn't support differ")
+	}
+
+	exp, err := containerimageexp.New(containerimageexp.Opt{
+		ImageStore:     dist.ImageStore,
+		ReferenceStore: dist.ReferenceStore,
+		Differ:         differ,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cacheStorage, err := bboltcachestorage.NewStore(filepath.Join(root, "cache.db"))
+	if err != nil {
+		return nil, err
+	}
+
+	// gcPolicy, err := getGCPolicy(opt.BuilderConfig, root)
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "could not get builder GC policy")
+	// }
+
+	layers, ok := snapshotter.(mobyworker.LayerAccess)
+	if !ok {
+		return nil, errors.Errorf("snapshotter doesn't support differ")
+	}
+
+	p := archutil.SupportedPlatforms(true)
+
+	leases, err := lm.List(context.TODO(), "labels.\"buildkit/lease.temporary\"")
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range leases {
+		lm.Delete(context.TODO(), l)
+	}
+
+	wopt := mobyworker.Opt{
+		ID: "moby",
+		// MetadataStore:     md,
+		ContentStore:      store,
+		CacheManager:      cm,
+		GCPolicy:          nil,
+		Snapshotter:       snapshotter,
+		Executor:          exec,
+		ImageSource:       src,
+		DownloadManager:   dist.DownloadManager,
+		V2MetadataService: dist.V2MetadataService,
+		Exporter:          exp,
+		// Transport:         rt,
+		Layers:    layers,
+		Platforms: p,
+	}
+
 	wc, err := newWorkerController(c, workerInitializerOpt{
 		config:         cfg,
 		sessionManager: sessionManager,
@@ -634,18 +858,19 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 	if err != nil {
 		return nil, err
 	}
+	w, err := envd.NewWorker(wopt, getBuildkitVersion())
+	if err != nil {
+		return nil, err
+	}
+	wc.Add(w)
+
 	frontends := map[string]frontend.Frontend{}
 	frontends["dockerfile.v0"] = forwarder.NewGatewayForwarder(wc, dockerfile.Build)
 	frontends["gateway.v0"] = gateway.NewGatewayFrontend(wc)
 
-	cacheStorage, err := bboltcachestorage.NewStore(filepath.Join(cfg.Root, "cache.db"))
-	if err != nil {
-		return nil, err
-	}
-
 	resolverFn := resolverFunc(cfg)
 
-	w, err := wc.GetDefault()
+	wd, err := wc.GetDefault()
 	if err != nil {
 		return nil, err
 	}
@@ -657,7 +882,7 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		"gha":      gha.ResolveCacheExporterFunc(),
 	}
 	remoteCacheImporterFuncs := map[string]remotecache.ResolveCacheImporterFunc{
-		"registry": registryremotecache.ResolveCacheImporterFunc(sessionManager, w.ContentStore(), resolverFn),
+		"registry": registryremotecache.ResolveCacheImporterFunc(sessionManager, wd.ContentStore(), resolverFn),
 		"local":    localremotecache.ResolveCacheImporterFunc(sessionManager),
 		"gha":      gha.ResolveCacheImporterFunc(),
 	}
@@ -672,6 +897,45 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		Entitlements:              cfg.Entitlements,
 		TraceCollector:            tc,
 	})
+}
+
+func newExecutor(root, cgroupParent string, dnsConfig *oci.DNSConfig, rootless bool, idmap *idtools.IdentityMapping, apparmorProfile string) (executor.Executor, error) {
+	netRoot := filepath.Join(root, "net")
+	nc := netproviders.Opt{
+		Mode: "auto",
+		CNI: cniprovider.Opt{
+			Root:       root,
+			ConfigPath: "/etc/buildkit/cni.json",
+			BinaryDir:  "/opt/cni/bin",
+		},
+	}
+
+	np, _, err := netproviders.Providers(nc)
+	if err != nil {
+		return nil, err
+	}
+
+	// make sure net state directory is cleared from previous state
+	fis, err := ioutil.ReadDir(netRoot)
+	if err == nil {
+		for _, fi := range fis {
+			fp := filepath.Join(netRoot, fi.Name())
+			if err := os.RemoveAll(fp); err != nil {
+				logrus.WithError(err).Errorf("failed to delete old network state: %v", fp)
+			}
+		}
+	}
+
+	return runcexecutor.New(runcexecutor.Opt{
+		Root:                filepath.Join(root, "executor"),
+		CommandCandidates:   []string{"runc"},
+		DefaultCgroupParent: cgroupParent,
+		Rootless:            rootless,
+		NoPivot:             os.Getenv("DOCKER_RAMDISK") != "",
+		IdentityMapping:     idmap,
+		DNS:                 dnsConfig,
+		ApparmorProfile:     apparmorProfile,
+	}, np)
 }
 
 func resolverFunc(cfg *config.Config) docker.RegistryHosts {
